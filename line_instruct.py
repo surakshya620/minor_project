@@ -3,7 +3,7 @@ from ultralytics import YOLO
 
 # Load trained model
 model = YOLO(
-    "/Users/namunakhadka/Desktop/vision_project/runs/obb/car_destination_detector/weights/best.pt"
+"runs/obb/car_destination_detector/weights/best.pt"
 )
 
 cap = cv2.VideoCapture(0)

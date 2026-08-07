@@ -2,15 +2,15 @@ import cv2
 from ultralytics import YOLO
 
 # Load trained model
-model = YOLO("/Users/namunakhadka/Desktop/vision_project/runs/obb/car_destination_detector/weights/best.pt")
+model = YOLO("runs/obb/car_destination_detector/weights/best.pt")
 # Change path if needed
 
-results = model.predict(
-    source=0,          # webcam or image path
-    conf=0.40,         # Start at 0.40 for OBB models
-    iou=0.30,          # Prevents double boxes on the same object
-    show=True
-)
+# results = model.predict(
+#     source=0,          # webcam or image path
+#     conf=0.40,         # Start at 0.40 for OBB models
+#     iou=0.30,          # Prevents double boxes on the same object
+#     show=True
+# )
 
 cap = cv2.VideoCapture(0)
 

@@ -1,7 +1,7 @@
 task: obb
 mode: train
 model: yolov8n-obb.pt
-data: /Users/namunakhadka/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb/data.yaml
+data: /Users/suru/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb/data.yaml
 epochs: 100
 time: null
 patience: 20
@@ -10,7 +10,7 @@ imgsz: 640
 save: true
 save_period: -1
 cache: false
-device: ''
+device: ""
 workers: 8
 project: null
 name: car_destination_detector
@@ -112,4 +112,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: tracktrack.yaml
-save_dir: /Users/namunakhadka/Desktop/vision_project/runs/obb/car_destination_detector
+save_dir: /Users/suru/Desktop/vision_project/runs/obb/car_destination_detector

@@ -1,8 +1,8 @@
-path: /Users/namunakhadka/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb
+path: /Users/suru/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb
 train: train/images
 val: valid/images
 test: test/images
 
-names: 
+names:
   0: Bottle
   1: car

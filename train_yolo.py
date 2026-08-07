@@ -6,7 +6,7 @@ def main():
     model = YOLO("yolov8n-obb.pt")
 
     model.train(
-        data=r"/Users/namunakhadka/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb/data.yaml",  
+        data=r"/Users/suru/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb/data.yaml",  
         epochs=100,
         imgsz=640,
         batch=8,                     # lower to 4 if you run out of memory

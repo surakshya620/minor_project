@@ -1,7 +1,7 @@
 import os
 
 # Base directory where your train, valid, test folders live
-base_dir = r"/Users/namunakhadka/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb"
+base_dir = r"/Users/suru/Desktop/vision_project/DYNAMIC.v1i.yolov8-obb"
 splits = ["train", "valid", "test"]
 
 for split in splits:

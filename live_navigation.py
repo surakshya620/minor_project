@@ -6,9 +6,9 @@ import serial
 from ultralytics import YOLO
 
 # ---------------- Config ----------------
-MODEL_PATH = "yolov8n-obb.pt"                       # trained weights (destination only)
+MODEL_PATH = "runs/obb/car_destination_detector/weights/best.pt"                      # trained weights (destination only)
 CAMERA_INDEX = 0
-BLUETOOTH_PORT = "/dev/tty.HC-05-SPPDev"     # <-- CHANGE THIS to your port
+BLUETOOTH_PORT = "COM6"     # <-- CHANGE THIS to your port
 BAUD_RATE = 9600
 CONF_THRESHOLD = 0.5
 HEADING_TOLERANCE_DEG = 15                   # within this angle -> go straight
@@ -16,7 +16,8 @@ MIN_MOVEMENT_PX = 4                          # ignore jitter smaller than this
 COMMAND_INTERVAL = 0.3                       # seconds between sent commands
 MIN_CAR_BLOB_AREA = 300                      # ignore tiny red noise specks
 
-CLASS_DEST = "destination"
+CLASS_DEST = "bottle"  # class name of the destination object in your YOLO model
+ 
 
 # Red wraps around the HSV hue circle (0 and 180 are both "red"), so we
 # need two ranges and combine them.
@@ -134,12 +135,19 @@ while True:
 
     # ---- Destination: YOLO ----
     results = model.predict(frame, conf=CONF_THRESHOLD, verbose=False)[0]
-    dest_box = None
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        cls_name = model.names[cls_id]
+
+dest_box = None
+
+if results.obb is not None:
+
+    for obb in results.obb:
+
+        cls_id = int(obb.cls[0])
+        cls_name = model.names[cls_id].lower()
+
         if cls_name == CLASS_DEST:
-            dest_box = box.xyxy[0].tolist()
+
+            dest_box = obb.xyxy[0].tolist()
             break
 
     display = frame.copy()
@@ -210,7 +218,7 @@ while True:
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         send_command('S')
-        break
+        
     elif key == ord('m'):
         show_mask = not show_mask
         if not show_mask:
