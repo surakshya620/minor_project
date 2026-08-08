@@ -30,9 +30,33 @@ via the homography) and by adding a small two-state planner:
     early. The waypoint is picked once and held (no re-flip-flopping every
     frame).
 
-"Too close, back off" is now a genuine emergency check using real
+"Too close, back off" is a genuine last-resort emergency check using real
 centimeters, not a noisy pixel heuristic, so it only fires when something
 really is right next to the car.
+
+DUPLEX ULTRASONIC + VISION FUSION (this version)
+-------------------------------------------------
+The Arduino no longer just uses its ultrasonic sensor to slam on the brakes
+locally. It continuously STREAMS every distance reading back over
+Bluetooth ("D,<cm>"), read here in a background thread
+(serial_reader_thread / get_ultrasonic_distance_cm). That live number is
+fused with what OpenCV sees:
+
+  - find_forward_obstacle_by_ultrasonic() cross-references a fresh
+    ultrasonic reading against vision-detected obstacle boxes to confirm
+    WHERE the obstacle is and how far, even before it's crossed onto the
+    direct car->bottle line (ULTRASONIC_PLAN_CM, ~30cm by default) -- so
+    avoidance starts early instead of at the last second.
+  - compute_bypass_waypoint() now sizes the bypass offset from the
+    obstacle's ACTUAL measured left/right edges on the ground plane
+    (obstacle_ground_edges), not a fixed symmetric guess, so a wide box
+    gets more berth and a narrow one doesn't cost an unnecessary detour.
+  - The "too close, back off" check now fuses vision distance and live
+    ultrasonic distance and reacts to whichever is closer -- it's a true
+    last-resort backstop now, since normal avoidance happens much earlier.
+    The Arduino keeps its own tiny hardware failsafe (SAFE_STOP_CM, ~6cm)
+    purely so the car never touches anything even if the Bluetooth link
+    lags -- it should essentially never fire in normal operation.
 
 BEFORE RUNNING THIS
 --------------------
@@ -51,6 +75,7 @@ import cv2
 import time
 import math
 import os
+import threading
 from collections import deque
 
 import numpy as np
@@ -100,14 +125,38 @@ WAYPOINT_EXTRA_MARGIN_CM = 8
 # How close the car must get to the bypass waypoint before we consider it
 # "reached" and drop back into normal direct-to-bottle driving.
 WAYPOINT_ARRIVAL_CM = 15
-# Genuine emergency distance (real cm, ground-plane) -- if any obstacle is
-# closer than this to the car right now, stop/back off immediately,
-# regardless of what mode we're in.
+# Genuine emergency distance (real cm, ground-plane / ultrasonic-fused) --
+# if the obstacle is closer than this RIGHT NOW, stop/back off immediately,
+# regardless of what mode we're in. This should rarely fire -- it's the
+# software-side last resort backing up the Arduino's own hardware failsafe;
+# normal avoidance happens much earlier via ULTRASONIC_PLAN_CM below.
 CAR_TOO_CLOSE_CM = 12
 # Where along the car->bottle line (0=at car, 1=at bottle) an obstacle must
 # project to for it to count as "in the way" rather than off to the side.
 BLOCK_T_MIN = 0.05
 BLOCK_T_MAX = 0.95
+
+# --- Ultrasonic <-> vision fusion (duplex obstacle avoidance) ----------------
+# The Arduino continuously streams "D,<cm>" lines back over Bluetooth (see
+# arduino_bluetooth_only.ino). ULTRASONIC_PLAN_CM is the distance at which
+# we start PROACTIVELY planning a route around whatever is ahead -- this is
+# deliberately much larger than the Arduino's own hardware failsafe distance
+# (SAFE_STOP_CM in the .ino, ~6cm) so the car steers around long before it's
+# ever in danger of touching anything.
+ULTRASONIC_PLAN_CM = 30
+# How many degrees off the car's current heading the ultrasonic sensor is
+# assumed to be "looking" -- it's a single forward-facing sensor, so a
+# reading is only trusted to explain a vision-obstacle if that obstacle is
+# roughly in front of the car (within this cone) when the reading comes in.
+ULTRASONIC_FORWARD_CONE_DEG = 35
+# If we haven't heard a fresh distance reading in this long, treat the
+# ultrasonic channel as unavailable (stale link) rather than trusting an
+# old number.
+ULTRASONIC_STALE_SEC = 1.0
+# Extra ground-plane clearance added past an obstacle's actual left/right
+# edge (as measured from its detected box, not just a symmetric guess) when
+# picking which side to route around.
+OBSTACLE_EDGE_MARGIN_CM = 10
 
 # --- Command smoothing ---------------------------------------------------------
 COMMAND_HOLD_FRAMES = 3          # a command must repeat this many frames in a row
@@ -158,12 +207,80 @@ print("[INFO] Camera started.")
 # ==============================================================================
 
 bluetooth_ser = None
+serial_write_lock = threading.Lock()
+
+# ---- Ultrasonic duplex state ------------------------------------------------
+# Updated continuously by serial_reader_thread(), read from the main loop.
+# Kept as a plain dict + lock rather than a class -- it's just one value plus
+# a timestamp so we can tell a fresh reading from a stale one.
+ultrasonic_state = {'distance_cm': None, 'last_update': 0.0}
+ultrasonic_lock = threading.Lock()
+
+
+def serial_reader_thread(ser):
+    """
+    Runs for the life of the program in the background. Blocks on
+    ser.readline() (that's fine -- it's its own thread), parses lines of the
+    form 'D,<cm>' streamed continuously by the Arduino, and stores the
+    latest value. This is what makes the link DUPLEX: the main loop can be
+    doing camera/YOLO work at the same time as this thread is listening for
+    the car's own sensor telling it something is close.
+    """
+    while True:
+        try:
+            raw = ser.readline()
+        except Exception as e:
+            print(f"[WARN] Serial read error: {e}")
+            time.sleep(0.5)
+            continue
+
+        if not raw:
+            continue  # readline() timed out with nothing available, try again
+
+        try:
+            line = raw.decode(errors="ignore").strip()
+        except Exception:
+            continue
+
+        if not line.startswith("D,"):
+            continue  # ignore anything else the Arduino might print
+
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            d = float(parts[1])
+        except ValueError:
+            continue
+
+        with ultrasonic_lock:
+            ultrasonic_state['distance_cm'] = d if d >= 0 else None
+            ultrasonic_state['last_update'] = time.time()
+
+
+def get_ultrasonic_distance_cm():
+    """
+    Returns the most recent ultrasonic reading in cm, or None if we've never
+    gotten one, the Arduino reported "no echo" (-1), or the reading is too
+    old to trust (stale link).
+    """
+    with ultrasonic_lock:
+        d = ultrasonic_state['distance_cm']
+        age = time.time() - ultrasonic_state['last_update']
+    if d is None or age > ULTRASONIC_STALE_SEC:
+        return None
+    return d
+
+
 if ENABLE_BLUETOOTH:
     try:
         import serial
         bluetooth_ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1)
         time.sleep(2)  # give HC-05 time to establish link
         print(f"[INFO] Bluetooth connected on {COM_PORT}.")
+        reader = threading.Thread(target=serial_reader_thread, args=(bluetooth_ser,), daemon=True)
+        reader.start()
+        print("[INFO] Ultrasonic duplex reader thread started.")
     except Exception as e:
         bluetooth_ser = None
         print(f"[WARN] Bluetooth NOT connected ({e}). Running in preview-only mode.")
@@ -173,7 +290,8 @@ def send_command(cmd):
     """Send a single-character command to the Arduino, if connected."""
     if bluetooth_ser is not None:
         try:
-            bluetooth_ser.write(cmd.encode())
+            with serial_write_lock:
+                bluetooth_ser.write(cmd.encode())
         except Exception as e:
             print(f"[WARN] Failed to send over Bluetooth: {e}")
 
@@ -327,11 +445,12 @@ def find_blocking_obstacle_ground(car_g, bottle_g, obstacle_boxes, H):
     """
     Look at every candidate obstacle's GROUND position (real cm) and find the
     one that is (a) roughly between the car and the bottle along the direct
-    path, and (b) close enough to that path to actually block it. Returns the
-    ground position (x_cm, y_cm) of the closest such obstacle, or None if the
-    path is clear.
+    path, and (b) close enough to that path to actually block it. Returns
+    (ground position, pixel box) of the closest such obstacle, or (None, None)
+    if the path is clear.
     """
     best_g = None
+    best_box = None
     best_dist_to_car = None
 
     for ob in obstacle_boxes:
@@ -342,18 +461,94 @@ def find_blocking_obstacle_ground(car_g, bottle_g, obstacle_boxes, H):
             dist_to_car = math.hypot(ob_g[0] - car_g[0], ob_g[1] - car_g[1])
             if best_g is None or dist_to_car < best_dist_to_car:
                 best_g = ob_g
+                best_box = ob
                 best_dist_to_car = dist_to_car
 
-    return best_g
+    return best_g, best_box
 
 
-def compute_bypass_waypoint(car_g, bottle_g, ob_g):
+def find_forward_obstacle_by_ultrasonic(car_g, heading_angle, obstacle_boxes, H, ultrasonic_cm):
+    """
+    THE FUSION STEP. Cross-references a fresh ultrasonic reading with
+    vision-detected obstacle boxes: looks for a vision obstacle roughly in
+    front of the car (within ULTRASONIC_FORWARD_CONE_DEG of its current
+    heading) whose ground-plane distance roughly agrees with what the
+    ultrasonic sensor just reported.
+
+    This is the two-way part: vision alone can miss a low-contrast obstacle,
+    or its contour detector can be a frame late; ultrasonic alone has no
+    idea how WIDE the thing is or which side has more room. Together: the
+    ultrasonic ping says "something is real and this far away, right now",
+    and vision supplies the shape needed to route around it intelligently
+    instead of just stopping.
+
+    Returns (ob_g, ob_box) for the best match, or (None, None) if nothing
+    lines up (e.g. ultrasonic is picking up something vision can't see at
+    all -- table edge, glare, etc -- in which case the emergency distance
+    check is still there as a backstop).
+    """
+    if ultrasonic_cm is None or heading_angle is None:
+        return None, None
+
+    best_box = None
+    best_g = None
+    best_diff = None
+
+    for ob in obstacle_boxes:
+        ob_g = pixel_to_ground(box_ground_point(ob), H)
+        bearing = angle_between(car_g, ob_g)
+        heading_diff = (bearing - heading_angle + 180) % 360 - 180
+        if abs(heading_diff) > ULTRASONIC_FORWARD_CONE_DEG:
+            continue  # not roughly where the ultrasonic sensor is pointed
+
+        vision_dist = math.hypot(ob_g[0] - car_g[0], ob_g[1] - car_g[1])
+        # Generous tolerance: ultrasonic is a single point reading off
+        # whatever's closest in its beam width, vision measures a box edge
+        # -- they won't match exactly, just roughly.
+        tolerance = max(20.0, ultrasonic_cm * 0.6)
+        dist_diff = abs(vision_dist - ultrasonic_cm)
+        if dist_diff > tolerance:
+            continue
+
+        if best_diff is None or dist_diff < best_diff:
+            best_diff = dist_diff
+            best_box = ob
+            best_g = ob_g
+
+    return best_g, best_box
+
+
+def obstacle_ground_edges(ob_box, H):
+    """
+    Instead of treating an obstacle as a single point, find its actual
+    LEFT and RIGHT edges on the ground plane -- this is what lets the
+    bypass waypoint be sized to the real obstacle instead of a fixed
+    symmetric guess. We take the box's bottom-left and bottom-right pixel
+    corners (the part of the box that actually touches the table) and run
+    each through the homography separately.
+    """
+    x1, y1, x2, y2 = ob_box
+    left_px = (float(x1), float(y2))
+    right_px = (float(x2), float(y2))
+    left_g = pixel_to_ground(left_px, H)
+    right_g = pixel_to_ground(right_px, H)
+    return left_g, right_g
+
+
+def compute_bypass_waypoint(car_g, bottle_g, ob_g, ob_box=None, H=None):
     """
     Build a single waypoint that steers around the obstacle at ob_g: a point
     offset sideways (perpendicular to the car->bottle direction) by a safety
     margin. Tries both sides and picks whichever stays inside the calibrated
     arena and is closer to the car's current position (i.e. less of a
     detour).
+
+    If ob_box + H are given, the offset is sized from the obstacle's ACTUAL
+    measured width on the ground plane (via obstacle_ground_edges) plus
+    OBSTACLE_EDGE_MARGIN_CM, rather than the fixed
+    OBSTACLE_SAFETY_RADIUS_CM + WAYPOINT_EXTRA_MARGIN_CM guess. A wide box
+    gets routed around with more berth; a narrow one doesn't cost an
+    unnecessarily long detour.
     """
     dx = bottle_g[0] - car_g[0]
     dy = bottle_g[1] - car_g[1]
@@ -363,7 +558,13 @@ def compute_bypass_waypoint(car_g, bottle_g, ob_g):
     ux, uy = dx / length, dy / length
     perp = (-uy, ux)  # rotate direction vector 90 degrees
 
-    offset = OBSTACLE_SAFETY_RADIUS_CM + WAYPOINT_EXTRA_MARGIN_CM
+    if ob_box is not None and H is not None:
+        left_g, right_g = obstacle_ground_edges(ob_box, H)
+        half_width = math.hypot(right_g[0] - left_g[0], right_g[1] - left_g[1]) / 2.0
+        offset = half_width + OBSTACLE_EDGE_MARGIN_CM
+    else:
+        offset = OBSTACLE_SAFETY_RADIUS_CM + WAYPOINT_EXTRA_MARGIN_CM
+
     cand_a = (ob_g[0] + perp[0] * offset, ob_g[1] + perp[1] * offset)
     cand_b = (ob_g[0] - perp[0] * offset, ob_g[1] - perp[1] * offset)
 
@@ -413,10 +614,16 @@ def steer_toward(car_g, target_g, heading_angle, reason_prefix):
 # ==============================================================================
 
 def decide_command(car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
-                    heading_angle, nav_state):
+                    heading_angle, nav_state, ultrasonic_cm=None):
     """
     car_g, bottle_g: ground-plane (cm) positions, already homography-corrected.
     heading_angle: the car's current real-world heading in degrees, or None.
+    ultrasonic_cm: latest live reading streamed from the Arduino (see
+               get_ultrasonic_distance_cm()), or None if unavailable/stale.
+               This is the DUPLEX half of the loop -- the car is telling the
+               laptop what's directly ahead of it, in real time, and that
+               gets fused with vision below instead of only ever causing a
+               local stop.
     nav_state: dict with 'mode' ('DIRECT' or 'AVOID') and 'waypoint'
                (ground-plane cm tuple or None), mutated in place so the
                chosen bypass route persists across frames instead of being
@@ -433,15 +640,27 @@ def decide_command(car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
         nav_state['waypoint'] = None
         return 'S', f"destination reached ({dist_to_bottle:.0f}cm)"
 
-    # ---- 2. Genuine emergency: something is right next to the car RIGHT NOW,
-    #         checked in real ground-plane cm (not noisy pixel distance) -----
+    # ---- 2. Genuine emergency: something is right next to the car RIGHT NOW.
+    #         Fuses vision (ground-plane cm) with the live ultrasonic reading
+    #         and reacts to whichever says "closer" -- vision can lose an
+    #         obstacle at point-blank range (it leaves the frame/gets
+    #         occluded by the car itself), ultrasonic can't. This should
+    #         rarely fire in practice since step 4 below reacts much earlier.
+    closest_vision_d = None
     for ob in obstacle_boxes:
         ob_g = pixel_to_ground(box_ground_point(ob), H_MATRIX)
         d = math.hypot(ob_g[0] - car_g[0], ob_g[1] - car_g[1])
-        if d < CAR_TOO_CLOSE_CM:
-            nav_state['mode'] = 'DIRECT'
-            nav_state['waypoint'] = None
-            return 'B', f"obstacle only {d:.0f}cm away - backing off"
+        if closest_vision_d is None or d < closest_vision_d:
+            closest_vision_d = d
+
+    fused_close_d = closest_vision_d
+    if ultrasonic_cm is not None and (fused_close_d is None or ultrasonic_cm < fused_close_d):
+        fused_close_d = ultrasonic_cm
+
+    if fused_close_d is not None and fused_close_d < CAR_TOO_CLOSE_CM:
+        nav_state['mode'] = 'DIRECT'
+        nav_state['waypoint'] = None
+        return 'B', f"obstacle only {fused_close_d:.0f}cm away - backing off"
 
     # ---- 3. Already mid-bypass? Keep heading for the committed waypoint
     #         until it's reached, or the direct path to the bottle opens up
@@ -449,8 +668,9 @@ def decide_command(car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
     if nav_state.get('mode') == 'AVOID' and nav_state.get('waypoint') is not None:
         wp = nav_state['waypoint']
         dist_to_wp = math.hypot(wp[0] - car_g[0], wp[1] - car_g[1])
-        path_clear_now = find_blocking_obstacle_ground(
-            car_g, bottle_g, obstacle_boxes, H_MATRIX) is None
+        still_blocked_g, _ = find_blocking_obstacle_ground(
+            car_g, bottle_g, obstacle_boxes, H_MATRIX)
+        path_clear_now = still_blocked_g is None
 
         if dist_to_wp <= WAYPOINT_ARRIVAL_CM or path_clear_now:
             nav_state['mode'] = 'DIRECT'
@@ -459,16 +679,40 @@ def decide_command(car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
             return steer_toward(car_g, wp, heading_angle, "bypassing obstacle")
 
     # ---- 4. Direct mode: is the straight path to the bottle blocked? ---------
-    blocking_ob_g = find_blocking_obstacle_ground(
+    # First ask vision alone (obstacle sitting on the car->bottle line).
+    blocking_ob_g, blocking_ob_box = find_blocking_obstacle_ground(
         car_g, bottle_g, obstacle_boxes, H_MATRIX)
 
+    # Then ask: does the live ultrasonic reading say something is closing in
+    # ahead, even before it's crossed onto the direct line? This is what
+    # makes avoidance PROACTIVE instead of a last-second dodge -- it can
+    # trigger well before the vision-only check above would.
+    ultrasonic_reason = ""
+    if blocking_ob_g is None and ultrasonic_cm is not None and ultrasonic_cm <= ULTRASONIC_PLAN_CM:
+        fused_g, fused_box = find_forward_obstacle_by_ultrasonic(
+            car_g, heading_angle, obstacle_boxes, H_MATRIX, ultrasonic_cm)
+        if fused_g is not None:
+            blocking_ob_g, blocking_ob_box = fused_g, fused_box
+            ultrasonic_reason = f", ultrasonic confirms {ultrasonic_cm:.0f}cm"
+        else:
+            # Ultrasonic sees something ahead but vision can't match a box to
+            # it yet -- still worth a cautious bypass using the car's own
+            # heading direction as the obstacle's assumed ground position,
+            # so we don't just drive blind at it waiting for vision to agree.
+            rad = math.radians(heading_angle) if heading_angle is not None else 0.0
+            assumed_g = (car_g[0] + math.sin(rad) * ultrasonic_cm,
+                         car_g[1] + math.cos(rad) * ultrasonic_cm)
+            blocking_ob_g, blocking_ob_box = assumed_g, None
+            ultrasonic_reason = f", ultrasonic-only ({ultrasonic_cm:.0f}cm, no vision match)"
+
     if blocking_ob_g is not None:
-        waypoint = compute_bypass_waypoint(car_g, bottle_g, blocking_ob_g)
+        waypoint = compute_bypass_waypoint(
+            car_g, bottle_g, blocking_ob_g, ob_box=blocking_ob_box, H=H_MATRIX)
         if waypoint is not None:
             nav_state['mode'] = 'AVOID'
             nav_state['waypoint'] = waypoint
             return steer_toward(car_g, waypoint, heading_angle,
-                                 "obstacle ahead - routing around")
+                                 "obstacle ahead - routing around" + ultrasonic_reason)
 
     # ---- 5. Clear path: steer straight for the bottle ------------------------
     nav_state['mode'] = 'DIRECT'
@@ -599,9 +843,11 @@ def main():
             if car_g is not None and bottle_g is not None:
                 dist_cm = math.hypot(bottle_g[0] - car_g[0], bottle_g[1] - car_g[1])
 
+            ultrasonic_cm = get_ultrasonic_distance_cm()
+
             command, reason = decide_command(
                 car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
-                heading_angle, nav_state
+                heading_angle, nav_state, ultrasonic_cm
             )
             command, reason = post_process_command(command, reason, dist_cm, nav_state)
 
@@ -637,7 +883,8 @@ def main():
             cv2.putText(frame, f"CMD: {command}  ({reason})", (15, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
 
-            mode_txt = f"MODE: {nav_state['mode']}"
+            ultra_txt = f"ULTRASONIC: {ultrasonic_cm:.0f}cm" if ultrasonic_cm is not None else "ULTRASONIC: --"
+            mode_txt = f"MODE: {nav_state['mode']}   {ultra_txt}"
             cv2.putText(frame, mode_txt, (15, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
             cv2.putText(frame, mode_txt, (15, 90),
