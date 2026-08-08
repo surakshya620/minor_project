@@ -804,6 +804,35 @@ def ground_to_pixel_approx(car_box, car_g, target_g):
     return (int(cx + dx * scale), int(cy - dy * scale))
 
 
+def draw_arrived_banner(frame):
+    """
+    Big bold pink 'DESTINATION REACHED' banner drawn centered over the
+    frame once the car has arrived. Drawn with a black outline pass first
+    so it stays readable regardless of what's behind it.
+    """
+    h, w = frame.shape[:2]
+    text = "DESTINATION REACHED"
+    font = cv2.FONT_HERSHEY_DUPLEX
+    scale = max(1.0, w / 700.0)
+    thickness_outline = 6
+    thickness_fill = 3
+    pink = (180, 20, 255)  # BGR -- bold pink/magenta
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness_outline)
+    x = max(10, (w - text_w) // 2)
+    y = max(text_h + 10, (h + text_h) // 2)
+
+    # translucent dark backdrop so the banner pops on any background
+    overlay = frame.copy()
+    pad = 20
+    cv2.rectangle(overlay, (x - pad, y - text_h - pad),
+                  (x + text_w + pad, y + baseline + pad), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    cv2.putText(frame, text, (x, y), font, scale, (0, 0, 0), thickness_outline, cv2.LINE_AA)
+    cv2.putText(frame, text, (x, y), font, scale, pink, thickness_fill, cv2.LINE_AA)
+
+
 # ==============================================================================
 # 9. MAIN LOOP
 # ==============================================================================
@@ -817,6 +846,7 @@ def main():
         'waypoint': None,
     }
     tx_state = {'pending_command': None, 'pending_count': 0, 'last_sent_command': ""}
+    arrived_command_sent = False
 
     print("[INFO] Starting navigation loop. Press 'q' or ESC to quit.")
 
@@ -851,9 +881,16 @@ def main():
             )
             command, reason = post_process_command(command, reason, dist_cm, nav_state)
 
-            if should_transmit(command, dist_cm, nav_state['arrived'], tx_state):
-                send_command(command)
-                print(f"[COMMAND] {command}  ({reason})")
+            if not nav_state['arrived']:
+                if should_transmit(command, dist_cm, nav_state['arrived'], tx_state):
+                    send_command(command)
+                    print(f"[COMMAND] {command}  ({reason})")
+            elif not arrived_command_sent:
+                # Send the final stop exactly once, then go completely silent --
+                # no more commands are transmitted for the rest of the run.
+                send_command('S')
+                print(f"[COMMAND] S  (destination reached - no further commands will be sent)")
+                arrived_command_sent = True
 
             # ------------------------- drawing -------------------------------
             if car_box:
@@ -899,6 +936,9 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
                 cv2.putText(frame, debug_txt, (15, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+            if nav_state['arrived']:
+                draw_arrived_banner(frame)
 
             cv2.imshow("Car -> Bottle Navigation", frame)
 
