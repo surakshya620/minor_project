@@ -1,31 +1,38 @@
 """
 ================================================================================
  CAR -> BOTTLE NAVIGATION SYSTEM  (Oblique Laptop Camera + Homography +
- Motion-Based Heading + Line-of-Sight Obstacle Check)
+ Motion-Based Heading + Ground-Plane Waypoint Obstacle Bypass)
 ================================================================================
 
-WHAT CHANGED FROM THE FIRST VERSION
+WHAT CHANGED IN THIS VERSION
 -------------------------------------
-Your laptop camera looks ACROSS the table, not straight down. That means raw
-pixel positions do NOT represent real-world left/right position -- an object
-close to the camera and one far away can be perfectly in line in real life
-but land at different x-pixels. This version fixes that in two ways:
+The old obstacle logic checked "is anything on the line between car and
+bottle" in raw PIXEL space, one frame at a time, and just replied L/R/B for
+that single frame with no memory. Two things went wrong with that:
 
-1. GROUND-PLANE HOMOGRAPHY. Run calibrate.py once to click the 4 corners of
-   your table/arena. That produces "homography.npy", a matrix that converts
-   any pixel into a real (x, y) position on the table in centimeters, as if
-   the camera were mounted straight overhead. This script loads that matrix
-   and uses it for every distance/direction decision.
+  1. With an oblique camera, pixel distances don't map to real distances
+     consistently -- objects near the camera look artificially close
+     together -- so the "obstacle too close, back up" check fired almost
+     every time something was directly ahead, and the car just reversed
+     instead of steering around.
+  2. Even when it did steer L/R, that was only a single-frame nudge, not an
+     actual plan to go around the object -- so the car would often turn back
+     toward the bottle again next frame, see the obstacle again, and repeat.
 
-2. MOTION-BASED HEADING. We don't know which way the car is physically
-   facing just by seeing its bounding box. So the script tracks the car's
-   ground position over the last few frames and computes its actual heading
-   from how it has been moving -- then compares that to the direction it
-   SHOULD be moving (car -> bottle) and turns to correct the difference.
+This version fixes both by working entirely in GROUND coordinates (real cm,
+via the homography) and by adding a small two-state planner:
 
-Obstacle detection is UNCHANGED: plain OpenCV contour detection checks if
-anything visually sits on the line between car and bottle in the camera
-image. No YOLO training needed for obstacles, as before.
+  - DIRECT mode: drive straight at the bottle (as before).
+  - AVOID mode: if an obstacle sits on the car->bottle line, compute ONE
+    bypass waypoint -- a point offset sideways from the obstacle by a safety
+    margin, on whichever side stays inside the calibrated arena -- and steer
+    toward THAT until it's reached or the direct line to the bottle clears
+    early. The waypoint is picked once and held (no re-flip-flopping every
+    frame).
+
+"Too close, back off" is now a genuine emergency check using real
+centimeters, not a noisy pixel heuristic, so it only fires when something
+really is right next to the car.
 
 BEFORE RUNNING THIS
 --------------------
@@ -70,11 +77,37 @@ BAUD_RATE = 9600
 OBSTACLE_MIN_AREA = 900          # ignore tiny noise blobs (pixels^2)
 OBSTACLE_THRESHOLD = 100         # 0-255, lower = only very dark objects picked up
 
+# --- Arena size -- MUST match ARENA_WIDTH_CM / ARENA_HEIGHT_CM in calibrate.py
+# (used to keep bypass waypoints inside the physical table area) -------------
+ARENA_WIDTH_CM = 100.0
+ARENA_HEIGHT_CM = 70.0
+
 # --- Ground-plane / heading thresholds ---------------------------------------
 ARRIVAL_DIST_CM = 15             # how close (real distance) counts as "arrived"
 HEADING_TOLERANCE_DEG = 15       # within this angle -> go straight
 HEADING_HISTORY_FRAMES = 5       # how many frames of car movement to look back over
 MIN_MOVEMENT_CM = 3              # ignore jitter smaller than this when estimating heading
+
+# --- Obstacle bypass (ground-plane waypoint routing) --------------------------
+# OBSTACLE_SAFETY_RADIUS_CM: how far (real cm) an obstacle's centre may sit
+# from the straight car->bottle line before it's considered "blocking".
+# Roughly: half the car's width + half the obstacle's width + a margin.
+OBSTACLE_SAFETY_RADIUS_CM = 20
+# Extra clearance added on top of the safety radius when placing the bypass
+# waypoint out to the side of the obstacle -- gives the car some real berth
+# instead of just barely clipping past it.
+WAYPOINT_EXTRA_MARGIN_CM = 8
+# How close the car must get to the bypass waypoint before we consider it
+# "reached" and drop back into normal direct-to-bottle driving.
+WAYPOINT_ARRIVAL_CM = 15
+# Genuine emergency distance (real cm, ground-plane) -- if any obstacle is
+# closer than this to the car right now, stop/back off immediately,
+# regardless of what mode we're in.
+CAR_TOO_CLOSE_CM = 12
+# Where along the car->bottle line (0=at car, 1=at bottle) an obstacle must
+# project to for it to count as "in the way" rather than off to the side.
+BLOCK_T_MIN = 0.05
+BLOCK_T_MAX = 0.95
 
 # --- Command smoothing ---------------------------------------------------------
 COMMAND_HOLD_FRAMES = 3          # a command must repeat this many frames in a row
@@ -264,80 +297,183 @@ def detect_obstacles(frame, ignore_boxes):
     return obstacle_boxes
 
 
-def line_blocked_by(box, p1, p2):
-    """True if the straight line segment p1->p2 (in pixel space) passes through `box`."""
-    x1, y1, x2, y2 = box
-    rect = (x1, y1, max(1, x2 - x1), max(1, y2 - y1))
-    p1_int = (int(round(p1[0])), int(round(p1[1])))
-    p2_int = (int(round(p2[0])), int(round(p2[1])))
-    inside, _, _ = cv2.clipLine(rect, p1_int, p2_int)
-    return inside
+# ==============================================================================
+# 6. GROUND-PLANE OBSTACLE GEOMETRY (replaces the old pixel-space line check)
+# ==============================================================================
+
+def project_point_on_segment(a, b, p):
+    """
+    Project point p onto the segment a->b.
+    Returns (t, perp_dist):
+      t         -- 0.0 at a, 1.0 at b (can be <0 or >1 if p projects outside)
+      perp_dist -- perpendicular distance from p to the infinite line a->b
+    All inputs/outputs are in the same units (we use ground-plane cm).
+    """
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-9:
+        return 0.0, math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / length_sq
+    proj_x = ax + t * dx
+    proj_y = ay + t * dy
+    perp_dist = math.hypot(px - proj_x, py - proj_y)
+    return t, perp_dist
 
 
-def which_side(p1, p2, point):
-    """Cross product sign: is `point` left or right of the directed line p1->p2."""
-    (x1, y1), (x2, y2) = p1, p2
-    (px, py) = point
-    return (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+def find_blocking_obstacle_ground(car_g, bottle_g, obstacle_boxes, H):
+    """
+    Look at every candidate obstacle's GROUND position (real cm) and find the
+    one that is (a) roughly between the car and the bottle along the direct
+    path, and (b) close enough to that path to actually block it. Returns the
+    ground position (x_cm, y_cm) of the closest such obstacle, or None if the
+    path is clear.
+    """
+    best_g = None
+    best_dist_to_car = None
+
+    for ob in obstacle_boxes:
+        ob_g = pixel_to_ground(box_ground_point(ob), H)
+        t, perp_dist = project_point_on_segment(car_g, bottle_g, ob_g)
+
+        if BLOCK_T_MIN <= t <= BLOCK_T_MAX and perp_dist <= OBSTACLE_SAFETY_RADIUS_CM:
+            dist_to_car = math.hypot(ob_g[0] - car_g[0], ob_g[1] - car_g[1])
+            if best_g is None or dist_to_car < best_dist_to_car:
+                best_g = ob_g
+                best_dist_to_car = dist_to_car
+
+    return best_g
+
+
+def compute_bypass_waypoint(car_g, bottle_g, ob_g):
+    """
+    Build a single waypoint that steers around the obstacle at ob_g: a point
+    offset sideways (perpendicular to the car->bottle direction) by a safety
+    margin. Tries both sides and picks whichever stays inside the calibrated
+    arena and is closer to the car's current position (i.e. less of a
+    detour).
+    """
+    dx = bottle_g[0] - car_g[0]
+    dy = bottle_g[1] - car_g[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return None
+    ux, uy = dx / length, dy / length
+    perp = (-uy, ux)  # rotate direction vector 90 degrees
+
+    offset = OBSTACLE_SAFETY_RADIUS_CM + WAYPOINT_EXTRA_MARGIN_CM
+    cand_a = (ob_g[0] + perp[0] * offset, ob_g[1] + perp[1] * offset)
+    cand_b = (ob_g[0] - perp[0] * offset, ob_g[1] - perp[1] * offset)
+
+    margin = 5.0  # small tolerance at the arena edges
+
+    def in_bounds(c):
+        return (-margin <= c[0] <= ARENA_WIDTH_CM + margin and
+                -margin <= c[1] <= ARENA_HEIGHT_CM + margin)
+
+    candidates = [c for c in (cand_a, cand_b) if in_bounds(c)]
+    if not candidates:
+        # Neither side is cleanly inside the arena (e.g. obstacle right at
+        # the edge) -- fall back to both and just pick the nearer one.
+        candidates = [cand_a, cand_b]
+
+    candidates.sort(key=lambda c: math.hypot(c[0] - car_g[0], c[1] - car_g[1]))
+    wx = min(max(candidates[0][0], 0.0), ARENA_WIDTH_CM)
+    wy = min(max(candidates[0][1], 0.0), ARENA_HEIGHT_CM)
+    return (wx, wy)
+
+
+def steer_toward(car_g, target_g, heading_angle, reason_prefix):
+    """
+    Shared steering logic: turn toward target_g using the car's estimated
+    real-world heading. Used for both "drive at the bottle" and "drive at
+    the bypass waypoint" -- they're the same problem, just a different
+    target point.
+    """
+    desired_angle = angle_between(car_g, target_g)
+
+    if heading_angle is None:
+        return 'F', f"{reason_prefix}: no heading yet, nudging forward"
+
+    diff = desired_angle - heading_angle
+    diff = (diff + 180) % 360 - 180  # normalize to -180..180
+
+    if abs(diff) <= HEADING_TOLERANCE_DEG:
+        return 'F', f"{reason_prefix}: aligned (off {diff:.0f} deg)"
+    elif diff > 0:
+        return 'R', f"{reason_prefix}: turn right (off {diff:.0f} deg)"
+    else:
+        return 'L', f"{reason_prefix}: turn left (off {diff:.0f} deg)"
 
 
 # ==============================================================================
-# 6. DECISION LOGIC
+# 7. DECISION LOGIC
 # ==============================================================================
 
-def decide_command(car_box, bottle_box, car_g, bottle_g, obstacle_boxes, heading_angle):
+def decide_command(car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
+                    heading_angle, nav_state):
     """
     car_g, bottle_g: ground-plane (cm) positions, already homography-corrected.
     heading_angle: the car's current real-world heading in degrees, or None.
+    nav_state: dict with 'mode' ('DIRECT' or 'AVOID') and 'waypoint'
+               (ground-plane cm tuple or None), mutated in place so the
+               chosen bypass route persists across frames instead of being
+               recomputed (and flip-flopped) every frame.
     Returns (command, reason_text).
     """
     if car_box is None or bottle_box is None or car_g is None or bottle_g is None:
         return 'S', "car/bottle not detected"
 
     # ---- 1. Have we arrived? (real-world distance, not pixel overlap) --------
-    dist_cm = math.hypot(bottle_g[0] - car_g[0], bottle_g[1] - car_g[1])
-    if dist_cm <= ARRIVAL_DIST_CM:
-        return 'S', f"destination reached ({dist_cm:.0f}cm)"
+    dist_to_bottle = math.hypot(bottle_g[0] - car_g[0], bottle_g[1] - car_g[1])
+    if dist_to_bottle <= ARRIVAL_DIST_CM:
+        nav_state['mode'] = 'DIRECT'
+        nav_state['waypoint'] = None
+        return 'S', f"destination reached ({dist_to_bottle:.0f}cm)"
 
-    # ---- 2. Is anything sitting on the straight (image-space) path? ----------
-    car_px = box_ground_point(car_box)
-    bottle_px = box_ground_point(bottle_box)
-
-    blocking_obstacle = None
+    # ---- 2. Genuine emergency: something is right next to the car RIGHT NOW,
+    #         checked in real ground-plane cm (not noisy pixel distance) -----
     for ob in obstacle_boxes:
-        if line_blocked_by(ob, car_px, bottle_px):
-            blocking_obstacle = ob
-            break
+        ob_g = pixel_to_ground(box_ground_point(ob), H_MATRIX)
+        d = math.hypot(ob_g[0] - car_g[0], ob_g[1] - car_g[1])
+        if d < CAR_TOO_CLOSE_CM:
+            nav_state['mode'] = 'DIRECT'
+            nav_state['waypoint'] = None
+            return 'B', f"obstacle only {d:.0f}cm away - backing off"
 
-    if blocking_obstacle is not None:
-        ob_center = box_center(blocking_obstacle)
-        side = which_side(car_px, bottle_px, ob_center)
+    # ---- 3. Already mid-bypass? Keep heading for the committed waypoint
+    #         until it's reached, or the direct path to the bottle opens up
+    #         early (no need to finish the whole detour if it's already clear) --
+    if nav_state.get('mode') == 'AVOID' and nav_state.get('waypoint') is not None:
+        wp = nav_state['waypoint']
+        dist_to_wp = math.hypot(wp[0] - car_g[0], wp[1] - car_g[1])
+        path_clear_now = find_blocking_obstacle_ground(
+            car_g, bottle_g, obstacle_boxes, H_MATRIX) is None
 
-        dist_to_car_px = math.hypot(ob_center[0] - car_px[0], ob_center[1] - car_px[1])
-        car_diag_px = math.hypot(car_box[2] - car_box[0], car_box[3] - car_box[1])
-        if dist_to_car_px < car_diag_px:
-            return 'B', "obstacle too close, backing up"
-
-        if side >= 0:
-            return 'L', "obstacle blocking path -> steering left"
+        if dist_to_wp <= WAYPOINT_ARRIVAL_CM or path_clear_now:
+            nav_state['mode'] = 'DIRECT'
+            nav_state['waypoint'] = None
         else:
-            return 'R', "obstacle blocking path -> steering right"
+            return steer_toward(car_g, wp, heading_angle, "bypassing obstacle")
 
-    # ---- 3. Clear path: steer using real heading vs. real desired direction --
-    desired_angle = angle_between(car_g, bottle_g)
+    # ---- 4. Direct mode: is the straight path to the bottle blocked? ---------
+    blocking_ob_g = find_blocking_obstacle_ground(
+        car_g, bottle_g, obstacle_boxes, H_MATRIX)
 
-    if heading_angle is None:
-        return 'F', "no heading yet, nudging forward to establish direction"
+    if blocking_ob_g is not None:
+        waypoint = compute_bypass_waypoint(car_g, bottle_g, blocking_ob_g)
+        if waypoint is not None:
+            nav_state['mode'] = 'AVOID'
+            nav_state['waypoint'] = waypoint
+            return steer_toward(car_g, waypoint, heading_angle,
+                                 "obstacle ahead - routing around")
 
-    diff = desired_angle - heading_angle
-    diff = (diff + 180) % 360 - 180  # normalize to -180..180
-
-    if abs(diff) <= HEADING_TOLERANCE_DEG:
-        return 'F', f"aligned (off by {diff:.0f} deg), driving forward"
-    elif diff > 0:
-        return 'R', f"heading off by {diff:.0f} deg -> turn right"
-    else:
-        return 'L', f"heading off by {diff:.0f} deg -> turn left"
+    # ---- 5. Clear path: steer straight for the bottle ------------------------
+    nav_state['mode'] = 'DIRECT'
+    nav_state['waypoint'] = None
+    return steer_toward(car_g, bottle_g, heading_angle, "path clear")
 
 
 def post_process_command(command, reason, dist_cm, nav_state):
@@ -399,7 +535,7 @@ def should_transmit(command, dist_cm, arrived, tx_state):
 
 
 # ==============================================================================
-# 7. DRAWING HELPERS
+# 8. DRAWING HELPERS
 # ==============================================================================
 
 def draw_box(frame, box, color, text):
@@ -409,13 +545,33 @@ def draw_box(frame, box, color, text):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
+def ground_to_pixel_approx(car_box, car_g, target_g):
+    """
+    Rough pixel position for drawing a ground-plane target (e.g. the bypass
+    waypoint) on screen. We don't have an inverse homography set up, so we
+    just anchor it near the car's own screen position, offset in the
+    direction of travel -- good enough for a debug overlay, not used for
+    any navigation math.
+    """
+    cx, cy = box_ground_point(car_box)
+    dx = target_g[0] - car_g[0]
+    dy = target_g[1] - car_g[1]
+    scale = 3.0  # purely visual scaling factor for the debug arrow
+    return (int(cx + dx * scale), int(cy - dy * scale))
+
+
 # ==============================================================================
-# 8. MAIN LOOP
+# 9. MAIN LOOP
 # ==============================================================================
 
 def main():
     car_history = deque(maxlen=HEADING_HISTORY_FRAMES)
-    nav_state = {'arrived': False, 'creep_counter': 0}
+    nav_state = {
+        'arrived': False,
+        'creep_counter': 0,
+        'mode': 'DIRECT',
+        'waypoint': None,
+    }
     tx_state = {'pending_command': None, 'pending_count': 0, 'last_sent_command': ""}
 
     print("[INFO] Starting navigation loop. Press 'q' or ESC to quit.")
@@ -444,7 +600,8 @@ def main():
                 dist_cm = math.hypot(bottle_g[0] - car_g[0], bottle_g[1] - car_g[1])
 
             command, reason = decide_command(
-                car_box, bottle_box, car_g, bottle_g, obstacle_boxes, heading_angle
+                car_box, bottle_box, car_g, bottle_g, obstacle_boxes,
+                heading_angle, nav_state
             )
             command, reason = post_process_command(command, reason, dist_cm, nav_state)
 
@@ -463,12 +620,28 @@ def main():
             if car_box and bottle_box:
                 p1 = (int(box_ground_point(car_box)[0]), int(box_ground_point(car_box)[1]))
                 p2 = (int(box_ground_point(bottle_box)[0]), int(box_ground_point(bottle_box)[1]))
-                cv2.line(frame, p1, p2, (0, 0, 255), 2)
+                line_color = (0, 200, 255) if nav_state['mode'] == 'AVOID' else (0, 0, 255)
+                cv2.line(frame, p1, p2, line_color, 1)
+
+            if (nav_state['mode'] == 'AVOID' and nav_state['waypoint'] is not None
+                    and car_box is not None and car_g is not None):
+                wp_px = ground_to_pixel_approx(car_box, car_g, nav_state['waypoint'])
+                car_px = (int(box_ground_point(car_box)[0]), int(box_ground_point(car_box)[1]))
+                cv2.circle(frame, wp_px, 8, (0, 200, 255), 2)
+                cv2.line(frame, car_px, wp_px, (0, 200, 255), 2)
+                cv2.putText(frame, "WAYPOINT", (wp_px[0] + 10, wp_px[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
 
             cv2.putText(frame, f"CMD: {command}  ({reason})", (15, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4)
             cv2.putText(frame, f"CMD: {command}  ({reason})", (15, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
+
+            mode_txt = f"MODE: {nav_state['mode']}"
+            cv2.putText(frame, mode_txt, (15, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+            cv2.putText(frame, mode_txt, (15, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1)
 
             if car_g is not None and bottle_g is not None:
                 heading_txt = f"{heading_angle:.0f}" if heading_angle is not None else "?"
