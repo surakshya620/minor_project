@@ -1,230 +1,206 @@
 import cv2
-import math
-import time
 import numpy as np
 import serial
+import time
 from ultralytics import YOLO
 
-# ---------------- Config ----------------
-MODEL_PATH = "runs/obb/car_destination_detector/weights/best.pt"                      # trained weights (destination only)
-CAMERA_INDEX = 0
-BLUETOOTH_PORT = "COM6"     # <-- CHANGE THIS to your port
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+
+MODEL_PATH = "runs/obb/car_destination_detector/weights/best.pt"
+
+COM_PORT = "COM6"          # Change if your HC-05 is on another COM port
 BAUD_RATE = 9600
-CONF_THRESHOLD = 0.5
-HEADING_TOLERANCE_DEG = 15                   # within this angle -> go straight
-MIN_MOVEMENT_PX = 4                          # ignore jitter smaller than this
-COMMAND_INTERVAL = 0.3                       # seconds between sent commands
-MIN_CAR_BLOB_AREA = 300                      # ignore tiny red noise specks
 
-CLASS_DEST = "bottle"  # class name of the destination object in your YOLO model
- 
+CAMERA_INDEX = 0
 
-# Red wraps around the HSV hue circle (0 and 180 are both "red"), so we
-# need two ranges and combine them.
-RED_LOWER_1 = np.array([0, 120, 70])
-RED_UPPER_1 = np.array([10, 255, 255])
-RED_LOWER_2 = np.array([170, 120, 70])
-RED_UPPER_2 = np.array([180, 255, 255])
+CONFIDENCE = 0.40
 
-# ---------------- Setup ----------------
+CAR_CLASS = "car"
+DEST_CLASS = "bottle"
+
+# Minimum contour area to consider an obstacle
+MIN_OBSTACLE_AREA = 1500
+
+# ==========================================================
+# LOAD MODEL
+# ==========================================================
+
+print("Loading YOLO model...")
+
 model = YOLO(MODEL_PATH)
 
+print("Model Loaded.")
+
+# ==========================================================
+# CAMERA
+# ==========================================================
+
 cap = cv2.VideoCapture(CAMERA_INDEX)
+
 if not cap.isOpened():
-    print("Error: could not open webcam.")
-    raise SystemExit(1)
+    print("Cannot open webcam.")
+    exit()
+
+print("Camera Started.")
+
+# ==========================================================
+# BLUETOOTH
+# ==========================================================
 
 try:
-    ser = serial.Serial(BLUETOOTH_PORT, BAUD_RATE, timeout=0.1)
-    time.sleep(2)  # allow HC-05 link to settle
-    print(f"Connected to Arduino on {BLUETOOTH_PORT}")
+
+    ser = serial.Serial(COM_PORT, BAUD_RATE)
+
+    time.sleep(2)
+
+    bluetooth = True
+
+    print("Bluetooth Connected")
+
 except Exception as e:
-    print(f"WARNING: could not open serial port ({e}). Running in vision-only "
-          f"preview mode; no commands will be sent.")
-    ser = None
 
-prev_car_center = None
-obstacle_priority = False   # True while Arduino owns the motors
-last_command_time = 0
-last_command_sent = None
-show_mask = False
+    bluetooth = False
 
+    print("Bluetooth Not Connected")
+
+    print(e)
+
+# ==========================================================
+# SEND COMMAND
+# ==========================================================
+
+last_command = ""
 
 def send_command(cmd):
-    """Send a single-character command to the Arduino, throttled."""
-    global last_command_time, last_command_sent
-    now = time.time()
-    if cmd == last_command_sent and (now - last_command_time) < COMMAND_INTERVAL:
+
+    global last_command
+
+    if cmd == last_command:
         return
-    if ser is not None:
+
+    last_command = cmd
+
+    print("COMMAND :", cmd)
+
+    if bluetooth:
+
         ser.write(cmd.encode())
-    last_command_time = now
-    last_command_sent = cmd
 
+# ==========================================================
+# DETECT CAR AND DESTINATION
+# ==========================================================
 
-def read_arduino_status():
-    """Check for an incoming status line from the Arduino (non-blocking)."""
-    global obstacle_priority
-    if ser is None:
-        return
-    while ser.in_waiting:
-        line = ser.readline().decode(errors="ignore").strip()
-        if not line:
+def detect_objects(frame):
+
+    results = model.predict(
+        frame,
+        conf=CONFIDENCE,
+        verbose=False
+    )
+
+    car_box = None
+    bottle_box = None
+
+    for r in results:
+
+        if r.obb is None:
             continue
-        print(f"[Arduino] {line}")
-        if line == "OBST":
-            obstacle_priority = True
-        elif line == "CLR":
-            obstacle_priority = False
 
+        for obb in r.obb:
 
-def find_red_car(frame):
-    """Return (x, y) center of the largest red blob, or None if not found."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask1 = cv2.inRange(hsv, RED_LOWER_1, RED_UPPER_1)
-    mask2 = cv2.inRange(hsv, RED_LOWER_2, RED_UPPER_2)
-    mask = cv2.bitwise_or(mask1, mask2)
+            cls = int(obb.cls[0])
 
-    # clean up noise
-    mask = cv2.erode(mask, None, iterations=2)
-    mask = cv2.dilate(mask, None, iterations=2)
+            label = model.names[cls].lower()
 
-    if show_mask:
-        cv2.imshow("Red Mask (press 'm' to hide)", mask)
+            x1, y1, x2, y2 = map(int, obb.xyxy[0])
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, None
+            if label == CAR_CLASS:
 
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < MIN_CAR_BLOB_AREA:
-        return None, None
+                car_box = (x1, y1, x2, y2)
 
-    x, y, w, h = cv2.boundingRect(largest)
-    center = (x + w / 2, y + h / 2)
-    box = (x, y, x + w, y + h)
-    return center, box
+            elif label == DEST_CLASS:
 
+                bottle_box = (x1, y1, x2, y2)
 
-def get_center(box):
+    return car_box, bottle_box
+
+# ==========================================================
+# CENTER OF BOX
+# ==========================================================
+
+def center(box):
+
     x1, y1, x2, y2 = box
-    return ((x1 + x2) / 2, (y1 + y2) / 2)
 
+    return (
+        int((x1+x2)/2),
+        int((y1+y2)/2)
+    )
 
-def angle_between(p_from, p_to):
-    """Angle in degrees of the vector p_from->p_to, 0 = pointing up (-y)."""
-    dx = p_to[0] - p_from[0]
-    dy = p_to[1] - p_from[1]
-    angle = math.degrees(math.atan2(dx, -dy))
-    return angle  # -180..180, positive = to the right
+# ==========================================================
+# DRAW BOX
+# ==========================================================
 
+def draw_box(frame, box, color, text):
 
-print("Starting live navigation loop.")
-print("Press 'q' to quit, 'm' to toggle the red-mask debug view.\n")
+    x1, y1, x2, y2 = box
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Camera error.")
-        break
+    cv2.rectangle(
+        frame,
+        (x1,y1),
+        (x2,y2),
+        color,
+        2
+    )
 
-    read_arduino_status()
+    cv2.putText(
+        frame,
+        text,
+        (x1,y1-10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        color,
+        2
+    )
 
-    # ---- Car: red color detection ----
-    car_center, car_box = find_red_car(frame)
+# ==========================================================
+# FIND OBSTACLES
+# ==========================================================
 
-    # ---- Destination: YOLO ----
-    results = model.predict(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+def detect_obstacles(frame):
 
-dest_box = None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-if results.obb is not None:
+    blur = cv2.GaussianBlur(gray,(5,5),0)
 
-    for obb in results.obb:
+    _, thresh = cv2.threshold(
+        blur,
+        100,
+        255,
+        cv2.THRESH_BINARY_INV
+    )
 
-        cls_id = int(obb.cls[0])
-        cls_name = model.names[cls_id].lower()
+    contours,_ = cv2.findContours(
+        thresh,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
 
-        if cls_name == CLASS_DEST:
+    obstacle_boxes = []
 
-            dest_box = obb.xyxy[0].tolist()
-            break
+    for cnt in contours:
 
-    display = frame.copy()
+        area = cv2.contourArea(cnt)
 
-    if car_box:
-        cv2.rectangle(display, (int(car_box[0]), int(car_box[1])),
-                       (int(car_box[2]), int(car_box[3])), (0, 255, 0), 2)
-        cv2.putText(display, "car", (int(car_box[0]), int(car_box[1]) - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    if dest_box:
-        cv2.rectangle(display, (int(dest_box[0]), int(dest_box[1])),
-                       (int(dest_box[2]), int(dest_box[3])), (0, 0, 255), 2)
-        cv2.putText(display, "destination", (int(dest_box[0]), int(dest_box[1]) - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        if area < MIN_OBSTACLE_AREA:
+            continue
 
-    if car_center is not None and dest_box is not None:
-        dest_center = get_center(dest_box)
+        x,y,w,h = cv2.boundingRect(cnt)
 
-        # draw the virtual straight line from car to destination
-        cv2.line(display, (int(car_center[0]), int(car_center[1])),
-                  (int(dest_center[0]), int(dest_center[1])), (255, 255, 0), 2)
-        cv2.circle(display, (int(car_center[0]), int(car_center[1])), 5, (0, 255, 0), -1)
-        cv2.circle(display, (int(dest_center[0]), int(dest_center[1])), 5, (0, 0, 255), -1)
+        obstacle_boxes.append(
+            (x,y,x+w,y+h)
+        )
 
-        desired_angle = angle_between(car_center, dest_center)
-
-        # estimate current heading from movement since last frame
-        heading_angle = None
-        if prev_car_center is not None:
-            dist_moved = math.hypot(car_center[0] - prev_car_center[0],
-                                     car_center[1] - prev_car_center[1])
-            if dist_moved >= MIN_MOVEMENT_PX:
-                heading_angle = angle_between(prev_car_center, car_center)
-
-        if not obstacle_priority:
-            if heading_angle is None:
-                cmd = 'F'  # no reliable heading yet -> nudge forward
-            else:
-                diff = desired_angle - heading_angle
-                diff = (diff + 180) % 360 - 180  # normalize to -180..180
-                if abs(diff) <= HEADING_TOLERANCE_DEG:
-                    cmd = 'F'
-                elif diff > 0:
-                    cmd = 'R'
-                else:
-                    cmd = 'L'
-            send_command(cmd)
-            status_text = f"CMD: {cmd}"
-        else:
-            status_text = "ARDUINO HAS PRIORITY (obstacle)"
-
-        prev_car_center = car_center
-
-        cv2.putText(display, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (0, 255, 255), 2)
-    else:
-        # lost sight of car or destination -> stop for safety
-        send_command('S')
-        missing = []
-        if car_center is None:
-            missing.append("car")
-        if dest_box is None:
-            missing.append("destination")
-        cv2.putText(display, f"Missing: {', '.join(missing)} - STOP", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-    cv2.imshow("Navigation", display)
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        send_command('S')
-        
-    elif key == ord('m'):
-        show_mask = not show_mask
-        if not show_mask:
-            cv2.destroyWindow("Red Mask (press 'm' to hide)")
-
-cap.release()
-cv2.destroyAllWindows()
-if ser is not None:
-    ser.close()
+    return obstacle_boxes
